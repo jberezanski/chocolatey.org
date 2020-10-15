@@ -25,7 +25,7 @@
 # For an explicit version of Chocolatey, please set $env:chocolateyVersion = 'versionnumber'
 # To target a different url for chocolatey.nupkg, please set $env:chocolateyDownloadUrl = 'full url to nupkg file'
 # NOTE: $env:chocolateyDownloadUrl does not work with $env:chocolateyVersion.
-# To use built-in compression instead of 7zip (requires additional download), please set $env:chocolateyUseWindowsCompression = 'true'
+# On legacy systems, to use built-in compression instead of 7zip (requires additional download), please set $env:chocolateyUseWindowsCompression = 'true'
 # To bypass the use of any proxy, please set $env:chocolateyIgnoreProxy = 'true'
 
 #specifically use the API to get the latest version (below)
@@ -178,24 +178,50 @@ if ($url -eq $null -or $url -eq '') {
 Write-Output "Getting Chocolatey from $url."
 Download-File $url $file
 
-# Determine unzipping method
-# 7zip is the most compatible so use it by default
-$7zaExe = Join-Path $tempDir '7za.exe'
-$unzipMethod = '7zip'
-$useWindowsCompression = $env:chocolateyUseWindowsCompression
-if ($useWindowsCompression -ne $null -and $useWindowsCompression -eq 'true') {
-  Write-Output 'Using built-in compression to unzip'
-  $unzipMethod = 'builtin'
-} elseif (-Not (Test-Path ($7zaExe))) {
-  Write-Output "Downloading 7-Zip commandline tool prior to extraction."
-  # download 7zip
-  Download-File 'https://chocolatey.org/7za.exe' "$7zaExe"
+function UnzipWith-PowerShell {
+param (
+  [string]$ZipPath,
+  [string]$DestinationPath
+ )
+  # available on PS 5+
+  if ($null -eq (Get-Command -Name 'Expand-Archive' -ErrorAction SilentlyContinue)) {
+    Write-Verbose "The 'Expand-Archive' command is not available."
+    return $false
+  }
+  Expand-Archive -Path $ZipPath -DestinationPath $DestinationPath -Force -ErrorAction Stop
+  return $true
 }
 
-# unzip the package
-Write-Output "Extracting $file to $tempDir..."
-if ($unzipMethod -eq '7zip') {
-  $params = "x -o`"$tempDir`" -bd -y `"$file`""
+function UnzipWith-DotNet {
+param (
+  [string]$ZipPath,
+  [string]$DestinationPath
+ )
+  # available on .NET 4.5+
+  try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+  } catch {
+    Write-Verbose "The 'System.IO.Compression.FileSystem' assembly is not available."
+    return $false
+  }
+  # does not support overwriting (will fail on existing files/directories)
+  [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestinationPath)
+  return $true
+}
+
+function UnzipWith-SevenZip {
+param (
+  [string]$ZipPath,
+  [string]$DestinationPath
+ )
+  # will work mostly everywhere, except on Server Core without WoW64
+  $7zaExe = Join-Path $DestinationPath '7za.exe'
+  if (-Not (Test-Path ($7zaExe))) {
+    Write-Verbose "Downloading 7-Zip commandline tool prior to extraction."
+    # download 7zip
+    Download-File 'https://chocolatey.org/7za.exe' "$7zaExe"
+  }
+  $params = "x -o`"$DestinationPath`" -bd -y `"$ZipPath`""
   # use more robust Process as compared to Start-Process -Wait (which doesn't
   # wait for the process to finish in PowerShell v3)
   $process = New-Object System.Diagnostics.Process
@@ -209,9 +235,9 @@ if ($unzipMethod -eq '7zip') {
   $exitCode = $process.ExitCode
   $process.Dispose()
 
-  $errorMessage = "Unable to unzip package using 7zip. Perhaps try setting `$env:chocolateyUseWindowsCompression = 'true' and call install again. Error:"
+  $errorMessage = "Unable to unzip package using 7zip. Error:"
   switch ($exitCode) {
-    0 { break }
+    0 { Write-Debug 'Unzipping succeeded' }
     1 { throw "$errorMessage Some files could not be extracted" }
     2 { throw "$errorMessage 7-Zip encountered a fatal error while extracting the files" }
     7 { throw "$errorMessage 7-Zip command line error" }
@@ -219,19 +245,61 @@ if ($unzipMethod -eq '7zip') {
     255 { throw "$errorMessage Extraction cancelled by the user" }
     default { throw "$errorMessage 7-Zip signalled an unknown error (code $exitCode)" }
   }
-} else {
-  if ($PSVersionTable.PSVersion.Major -lt 5) {
-    try {
-      $shellApplication = new-object -com shell.application
-      $zipPackage = $shellApplication.NameSpace($file)
-      $destinationFolder = $shellApplication.NameSpace($tempDir)
-      $destinationFolder.CopyHere($zipPackage.Items(),0x10)
-    } catch {
-      throw "Unable to unzip package using built-in compression. Set `$env:chocolateyUseWindowsCompression = 'false' and call install again to use 7zip to unzip. Error: `n $_"
-    }
+  return $true
+}
+
+function UnzipWith-Explorer {
+param (
+  [string]$ZipPath,
+  [string]$DestinationPath
+ )
+  # will not work on Server Core
+  $shellApplication = new-object -com shell.application
+  $zipPackage = $shellApplication.NameSpace($ZipPath)
+  $destinationFolder = $shellApplication.NameSpace($DestinationPath)
+  $destinationFolder.CopyHere($zipPackage.Items(),0x10)
+  return $true
+}
+
+# Determine unzipping method
+$unzipMethods = $env:chocolateyUnzipMethods
+if ([string]::IsNullOrEmpty($unzipMethods)) {
+  if ($env:chocolateyUseWindowsCompression -eq 'true') {
+    $unzipMethods = 'PowerShell,DotNet,Explorer'
   } else {
-    Expand-Archive -Path "$file" -DestinationPath "$tempDir" -Force
+    $unzipMethods = 'PowerShell,DotNet,SevenZip,Explorer'
   }
+}
+
+$unzipMethodsList = $unzipMethods -split '[,;\|\s]+' # allowed separators: comma, semicolon, pipe, whitespace
+Write-Output "These unzip methods will be attempted in order: $unzipMethodsList"
+Write-Output "This list may be adjusted using the 'chocolateyUnzipMethods' environment variable."
+
+# clear the destination directory from any previously unzipped files, skipping the zip
+# and 7za.exe (in case an admin wants to provision it out of band to avoid download)
+Get-ChildItem -Path $tempDir -Exclude @((Split-Path -Leaf -Path $file), '7za.exe') | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+# unzip the package
+Write-Output "Extracting $file to $tempDir..."
+$unzipSuccess = $false
+foreach ($method in $unzipMethodsList) {
+  $fn = Get-Command -CommandType Function -Name "UnzipWith-$method" -ErrorAction SilentlyContinue
+  if ($null -eq $fn) {
+    throw "Unknown unzip method: $method"
+  }
+  Write-Output "Attempting unzip method: $method"
+  try {
+    $unzipSuccess = & $fn -ZipPath "$file" -DestinationPath "$tempDir"
+  } catch {
+    Write-Warning "Unable to unzip package using method '$method'. Error: `n $_"
+  }
+  if ($unzipSuccess) {
+    break
+  }
+}
+
+if (-not $unzipSuccess) {
+  throw "All attempted unzip methods failed!"
 }
 
 # Call chocolatey install
